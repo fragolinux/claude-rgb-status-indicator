@@ -168,8 +168,9 @@ WSL) shim talks to the port directly. Only Python 3.6+ is required.
 
 ### Do not copy `settings.json` between machines
 
-Copy **`claude_rgb.py`** (and `device/` if you want to edit the firmware), then
-run `install` there. Never copy `settings.json` across.
+Copy **`claude_rgb.py`** — plus the firmware directory of whichever board you
+use, if you want to edit or deploy it — then run `install` there. Never copy
+`settings.json` across.
 
 Two reasons. First, the hook command records the **absolute path of this
 file** and the **absolute path of the Python interpreter** that ran it — both

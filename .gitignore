@@ -1,7 +1,7 @@
 # The board's own config, if it is ever pulled off the device.
 # It holds Wi-Fi SSIDs and passwords in plain text -- never commit it.
 config.json
-device/config.json
+*/config.json
 
 # Host-side per-machine settings (absolute paths, local IPs).
 claude-rgb.json
