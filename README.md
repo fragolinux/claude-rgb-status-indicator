@@ -261,6 +261,52 @@ Everything else — hook installation, config, `deploy`, `setup` — is the same
 as on Windows, and `install` writes the right absolute paths for the machine
 it runs on.
 
+### VS Code, Cursor and the other IDE extensions
+
+Nothing to do. Hooks are a harness feature, not a terminal one, and the
+extension reads the same `~/.claude/settings.json` as the CLI. Install once and
+it works in the chat panel, the integrated terminal, and anywhere else Claude
+Code runs on that machine.
+
+### Dev containers and Codespaces
+
+Treat the container as a separate machine, because that is what it is: its own
+`~/.claude`, its own filesystem, its own network stack. Three things follow.
+
+**Hooks have to live in the repository, not the home directory.** A container's
+home is discarded on rebuild, so `install` into `~/.claude` has to be redone
+every time. Install into the project instead:
+
+```bash
+python claude_rgb.py install --project
+```
+
+That writes `.claude/settings.json` in the repository, using
+`${CLAUDE_PROJECT_DIR}` and a bare `python3` rather than absolute paths. Commit
+it and the indicator survives rebuilds, and works for anyone else who opens the
+same container.
+
+**The container needs Python 3.** Most base images have it; a Node-only image
+does not. Add it in the Dockerfile, or use a base image that includes it.
+
+**Serial is not available, so plan the transport.**
+
+| Host | What works |
+|---|---|
+| Linux | Pass the device through: `"runArgs": ["--device=/dev/ttyUSB0"]` in `devcontainer.json`. The cable then behaves normally. |
+| Docker Desktop on Windows or macOS | No USB passthrough exists. Wi-Fi is the practical route. |
+| GitHub Codespaces | Remote machine, no LAN access to your desk at all. The indicator cannot be reached; leave it uninstalled there. |
+
+For the Wi-Fi route, the container reaches the LAN through Docker's NAT, so
+**unicast works and broadcast does not** — the datagram never leaves the
+bridge. Set the address explicitly, in the config *inside* the container:
+
+```json
+{ "host": "192.168.1.50", "transport": "udp" }
+```
+
+Reserve that address for the board on your router, or DHCP will move it.
+
 ### WSL
 
 WSL is the one case that needs thought. It is a separate environment with its
@@ -393,6 +439,7 @@ python claude_rgb.py wifi test      # prove datagrams really reach the board
 python claude_rgb.py wifi off       # radio down now, back to the cable
 python claude_rgb.py deploy 01space # push firmware and restart the board
 python claude_rgb.py install        # merge the hooks into settings.json
+python claude_rgb.py install --project   # ... into the repo, for dev containers
 python claude_rgb.py uninstall      # remove only our hooks
 ```
 

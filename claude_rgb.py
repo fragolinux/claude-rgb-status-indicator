@@ -20,6 +20,8 @@ Usage:
     claude_rgb.py brightness <n>   set panel brightness (0-255)
     claude_rgb.py selftest         verify the matrix orientation
     claude_rgb.py install          merge the hooks into ~/.claude/settings.json
+    claude_rgb.py install --project  ... into the repo's .claude/settings.json,
+                                   portable: for dev containers and Codespaces
     claude_rgb.py uninstall        remove only our hooks, leave the rest
 
 Per-machine settings live in ~/.claude/claude-rgb.json:
@@ -1003,12 +1005,38 @@ def cmd_install(args):
     Never overwrites the file wholesale: other people's hooks, other events,
     and every other top-level key are carried through untouched. Re-running is
     safe -- our own previous entries are replaced rather than duplicated.
+
+    With --project, writes the repository's own `.claude/settings.json` using
+    the ${CLAUDE_PROJECT_DIR} placeholder and a bare `python3` instead of
+    absolute paths. That form survives a dev container rebuild, which throws
+    away the container's home directory and with it anything under ~/.claude.
     """
-    settings_path = args[0] if args else os.path.join(
-        os.path.expanduser("~"), ".claude", "settings.json")
-    script = os.path.abspath(__file__)
-    interpreter = sys.executable or "python3"
-    command = '"%s" "%s" hook' % (interpreter, script)
+    project = "--project" in args
+    args = [a for a in args if a != "--project"]
+
+    if project:
+        settings_path = os.path.join(os.getcwd(), ".claude", "settings.json")
+        script = os.path.abspath(__file__)
+        root = os.getcwd()
+        try:
+            relative = os.path.relpath(script, root)
+        except ValueError:
+            relative = None
+        if relative is None or relative.startswith(".."):
+            print("--project needs this script to live inside the project.")
+            print("  script:  %s" % script)
+            print("  project: %s" % root)
+            return 1
+        # Bare python3, not sys.executable: project settings are checked in and
+        # read by whoever opens the repo, container or host.
+        command = 'python3 "${CLAUDE_PROJECT_DIR}/%s" hook' % relative.replace(
+            os.sep, "/")
+    else:
+        settings_path = args[0] if args else os.path.join(
+            os.path.expanduser("~"), ".claude", "settings.json")
+        script = os.path.abspath(__file__)
+        interpreter = sys.executable or "python3"
+        command = '"%s" "%s" hook' % (interpreter, script)
 
     try:
         settings = _load_settings(settings_path)
@@ -1053,6 +1081,9 @@ def cmd_install(args):
         save_config(dict(DEFAULT_CONFIG))
 
     print("Installed %d hooks into %s" % (len(HOOK_EVENTS), settings_path))
+    if project:
+        print("  portable form: python3 + ${CLAUDE_PROJECT_DIR}, no absolute paths")
+        print("  commit this file so it survives a container rebuild")
     if replaced:
         print("  replaced %d earlier claude-rgb entries" % replaced)
     print("  kept %d existing hook entries on those same events" % kept)
