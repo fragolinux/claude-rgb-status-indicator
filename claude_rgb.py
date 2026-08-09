@@ -10,6 +10,7 @@ Usage:
     claude_rgb.py doctor           check every link in the chain on this machine
     claude_rgb.py hook <state>     report a state, reading hook JSON on stdin
     claude_rgb.py send <state>     report a state manually (for testing)
+    claude_rgb.py reset            forget every session; back to idle
     claude_rgb.py deploy [device]  upload <device>/main.py and restart the board
     claude_rgb.py setup            configure the board's Wi-Fi profiles
     claude_rgb.py wifi test        prove datagrams really reach the board
@@ -648,6 +649,28 @@ def verify_udp(cfg, ip):
     return None
 
 
+def cmd_reset(args):
+    """Forget every reporting session, dropping the board back to idle.
+
+    Needed because arbitration is by priority and `idle` sits at the bottom of
+    it: `send idle` registers a session that can never outrank a live one, so
+    it cannot be used to quiet the panel. Clearing the list can.
+    """
+    cfg = load_config()
+    try:
+        reply = talk(cfg, "v1 * reset", wait=1.5, until="OK")
+        print(reply.strip() or "reset sent")
+        return 0
+    except SerialError:
+        # No cable: the board handles control messages over UDP too, we just
+        # cannot read the acknowledgement back.
+        if send_udp(cfg, "v1 * reset"):
+            print("reset sent over UDP (unacknowledged)")
+            return 0
+        print("no transport available")
+        return 1
+
+
 def cmd_ports(args):
     cfg = load_config()
     in_use = resolve_port(cfg, remember=False)
@@ -1163,6 +1186,7 @@ COMMANDS = {
     "doctor": cmd_doctor,
     "hook": cmd_hook,
     "send": cmd_send,
+    "reset": cmd_reset,
     "setup": cmd_setup,
     "wifi": cmd_wifi,
     "deploy": cmd_deploy,

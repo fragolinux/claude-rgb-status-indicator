@@ -345,14 +345,36 @@ bottom of a curve, because a curve that merely touches zero never quite goes
 out. And **red beats twice**, through zero, where the others beat once: a
 rhythm is recognised before a colour is.
 
-Priority: `ask` (90) > `error` (80) > running (50) > `done` (20) >
-`idle` (10). With several windows open you always see the most urgent one,
-across every machine reporting to the same board.
+### How the board decides what to show
 
-`done` is deliberately **persistent** — it keeps pulsing until your next
-prompt, so walking back after ten minutes still tells you the turn finished.
-Everything else carries a TTL, so a session that dies never leaves the panel
-stuck.
+It does not hold a current state that each message overwrites. It holds a
+**list of sessions**, each with its own state and expiry, and draws the most
+urgent one:
+
+```
+ask (90) > error (80) > running (50) > done (20) > idle (10)
+```
+
+So with several windows open — on several machines, if they share a board over
+Wi-Fi — you always see the one that most needs you, and a permission prompt in
+a window you had forgotten still gets through.
+
+Two consequences worth knowing:
+
+**`idle` cannot be forced.** It sits at the bottom of the scale, so
+`send idle` adds a session that can never outrank a live one. To quiet the
+panel you empty the list rather than adding a calm entry to it:
+
+```bash
+python claude_rgb.py reset
+```
+
+A long press on **B** does the same on the board itself.
+
+**`done` is deliberately persistent.** It keeps pulsing until your next prompt,
+so walking back after ten minutes still tells you the turn finished. Every
+other state carries a TTL — five minutes for the working states — so a session
+that dies never leaves the panel stuck.
 
 ---
 
@@ -362,6 +384,7 @@ stuck.
 python claude_rgb.py doctor         # is everything wired up on this machine?
 python claude_rgb.py status         # what the board currently thinks
 python claude_rgb.py send ask       # force a state, to see it
+python claude_rgb.py reset          # forget every session; back to idle
 python claude_rgb.py brightness 25  # 0-255, persisted on the board
 python claude_rgb.py ports          # candidate serial ports
 python claude_rgb.py selftest       # check and fix matrix orientation
@@ -603,7 +626,8 @@ If an edit ever leaves the board unable to boot, hold **B** while powering up:
 | Panel dark, `doctor` says the board doesn't answer | Cable, or the wrong port. `ports` lists candidates; set `port` explicitly. |
 | `doctor` says the hook points at a different copy | You moved `claude_rgb.py`. Re-run `install`. |
 | Nothing happens in a new session | Claude Code was running when you installed. Restart it. |
-| Panel stuck on one state | A session died mid-flight. Long-press **B**, or wait for the TTL. |
+| Panel stuck on one state | A session died mid-flight. `reset`, or long-press **B**, or wait for the TTL. |
+| `send idle` does nothing | By design — `idle` is the lowest priority and cannot outrank a live session. Use `reset`. |
 | Colours right, chase spins the wrong way | Run `selftest` and answer two questions. |
 | Works on Windows, not in WSL | Expected — see the WSL note above. |
 | `status` shows an IP, `send` says sent, board ignores it | Run `wifi test`. If broadcast fails and unicast works, the network isolates clients — set `host`. If both fail, the board holds an address with nothing listening. |
