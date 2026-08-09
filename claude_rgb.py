@@ -12,6 +12,8 @@ Usage:
     claude_rgb.py send <state>     report a state manually (for testing)
     claude_rgb.py deploy [device]  upload <device>/main.py and restart the board
     claude_rgb.py setup            configure the board's Wi-Fi profiles
+    claude_rgb.py wifi test        prove datagrams really reach the board
+    claude_rgb.py wifi off         radio down now; back to the cable
     claude_rgb.py status           ask the board how it's doing
     claude_rgb.py ports            list candidate serial ports
     claude_rgb.py brightness <n>   set panel brightness (0-255)
@@ -332,18 +334,63 @@ def resolve_port(cfg, remember=False):
 # ------------------------------------------------------------- transports
 
 
+def broadcast_sources():
+    """Local addresses worth sending a broadcast from.
+
+    A bare sendto to 255.255.255.255 leaves by whichever interface the routing
+    table happens to prefer. On a machine carrying a VPN, ZeroTier or WSL
+    bridges -- so, most real machines -- that is frequently not the interface
+    the board is on, and the datagram silently goes nowhere useful.
+
+    Asking the OS which source address it would choose for a handful of private
+    destinations costs about half a millisecond each and no DNS lookup, which
+    matters because this runs on every hook. Enumerating interfaces properly
+    via gethostbyname_ex measured 50 ms on the same machine.
+    """
+    found = []
+    for probe in ("255.255.255.255", "10.255.255.255",
+                  "172.31.255.255", "192.168.255.255"):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect((probe, 1))  # no traffic; just consults the route table
+            local = sock.getsockname()[0]
+            if local and not local.startswith("169.254.") and local not in found:
+                found.append(local)
+        except Exception:
+            pass
+        finally:
+            sock.close()
+    return found
+
+
 def send_udp(cfg, line):
     payload = line.encode()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        target = cfg.get("host") or "255.255.255.255"
-        sock.sendto(payload, (target, UDP_PORT))
-        return True
-    except Exception:
-        return False
-    finally:
-        sock.close()
+
+    if cfg.get("host"):
+        # An explicit address means unicast, and no interface to guess at.
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.sendto(payload, (cfg["host"], UDP_PORT))
+            return True
+        except Exception:
+            return False
+        finally:
+            sock.close()
+
+    delivered = False
+    for source in broadcast_sources() or [None]:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            if source:
+                sock.bind((source, 0))
+            sock.sendto(payload, ("255.255.255.255", UDP_PORT))
+            delivered = True
+        except Exception:
+            pass
+        finally:
+            sock.close()
+    return delivered
 
 
 def send_serial(cfg, line, attempts=3):
@@ -368,18 +415,27 @@ def send_serial(cfg, line, attempts=3):
 
 
 def dispatch(cfg, line):
+    """Send `line` over every transport in play.
+
+    Returns a list of (transport, outcome) so callers can report honestly.
+    Note what "ok" can and cannot mean: a serial write is confirmed by the
+    port accepting it, but UDP is fire-and-forget -- it reports success even
+    with the board switched off. Only the cable can tell you anything.
+    """
     # `enabled` is checked by the hook path alone: switching the indicator off
     # should stop it reacting to the session, not stop you driving it by hand.
     mode = cfg.get("transport", "auto")
     if mode == "off":
-        return False
-    if mode == "udp":
-        return send_udp(cfg, line)
-    if mode == "serial":
-        return send_serial(cfg, line)
-    # auto: the datagram is free, the cable is authoritative. Do both.
-    ok = send_udp(cfg, line)
-    return send_serial(cfg, line) or ok
+        return []
+
+    sent = []
+    if mode in ("auto", "udp"):
+        target = cfg.get("host") or "broadcast"
+        sent.append(("udp -> %s" % target, send_udp(cfg, line)))
+    if mode in ("auto", "serial"):
+        port = resolve_port(cfg)
+        sent.append(("serial -> %s" % (port or "no port"), send_serial(cfg, line)))
+    return sent
 
 
 # ------------------------------------------------------------ hook mapping
@@ -464,9 +520,20 @@ def cmd_send(args):
         return 2
     cfg = load_config()
     cid = "%s:manual" % socket.gethostname().split(".")[0]
-    ok = dispatch(cfg, "v1 %s %s" % (cid, args[0]))
-    print("sent" if ok else "no transport available")
-    return 0 if ok else 1
+    sent = dispatch(cfg, "v1 %s %s" % (cid, args[0]))
+
+    if not sent:
+        print("no transport enabled (transport=%s)" % cfg.get("transport"))
+        return 1
+    for name, ok in sent:
+        if not ok:
+            print("  %-28s failed" % name)
+        elif name.startswith("udp"):
+            # Say so plainly: this line would print with the board unplugged.
+            print("  %-28s away (UDP is unacknowledged -- watch the board)" % name)
+        else:
+            print("  %-28s written" % name)
+    return 0 if any(ok for _, ok in sent) else 1
 
 
 def talk(cfg, line, wait=2.0, until=None, port=None):
@@ -488,6 +555,97 @@ def talk(cfg, line, wait=2.0, until=None, port=None):
         return buf.decode(errors="replace")
     finally:
         conn.close()
+
+
+# ------------------------------------------------------- udp verification
+#
+# UDP is unacknowledged, so nothing on the sending side can tell you a
+# datagram arrived -- send_udp() reports success with the board switched off.
+# The only honest check is to send over UDP and read the result back over the
+# cable, which is what these do.
+
+
+def client_count(cfg):
+    """How many sessions the board currently knows about, or None."""
+    try:
+        reply = talk(cfg, "v1 * status", wait=2.0, until="STATUS")
+    except Exception:
+        return None
+    for token in reply.split():
+        if token.startswith("clients="):
+            try:
+                return int(token.split("=", 1)[1])
+            except Exception:
+                return None
+    return None
+
+
+def probe_udp(cfg, host=None):
+    """Send one datagram over UDP; report whether the board registered it.
+
+    `host` None means broadcast. Returns True, False, or None when the board
+    could not be read over serial at all.
+    """
+    talk(cfg, "v1 setup:probe gone", wait=0.5)
+    before = client_count(cfg)
+    if before is None:
+        return None
+
+    # A deliberately low-priority state, so the probe cannot disturb whatever
+    # a live session is showing while this runs.
+    send_udp({"host": host} if host else {}, "v1 setup:probe idle")
+    time.sleep(1.2)
+
+    after = client_count(cfg)
+    talk(cfg, "v1 setup:probe gone", wait=0.5)
+    if after is None:
+        return None
+    return after > before
+
+
+def verify_udp(cfg, ip):
+    """Check both UDP paths and say what the result means for the config."""
+    print("\nChecking that datagrams actually arrive.")
+    print("(An IP alone proves nothing -- the board can hold an address and")
+    print(" still have nothing listening on the port.)\n")
+
+    broadcast = probe_udp(cfg, None)
+    unicast = probe_udp(cfg, ip) if ip else None
+
+    def label(result):
+        return {True: "reaches the board", False: "does not arrive",
+                None: "could not be checked"}[result]
+
+    print("  broadcast  %s" % label(broadcast))
+    print("  unicast    %s" % label(unicast))
+    print()
+
+    if broadcast:
+        print("Wi-Fi is working, with nothing to configure. Broadcast needs no")
+        print("address, so moving between sites will keep working by itself.")
+        return "broadcast"
+
+    if unicast:
+        print("Broadcast is blocked on this network -- common on guest Wi-Fi and")
+        print("some phone hotspots, which isolate clients from each other.")
+        print("Unicast works, so setting an explicit address fixes it:")
+        print()
+        print('  "host": "%s"   in %s' % (ip, CONFIG_PATH))
+        print()
+        print("Reserve that address for the board on your router, or DHCP will")
+        print("move it and this will stop working.")
+        answer = input("Write it into the config now? [Y/n] ").strip().lower()
+        if answer in ("", "y", "yes"):
+            cfg["host"] = ip
+            save_config(cfg)
+            print("Done.")
+        return "unicast"
+
+    print("Neither path reaches the board, so Wi-Fi is not usable here.")
+    print("Nothing is broken: `transport` is `auto`, so the indicator keeps")
+    print("running over the cable exactly as before. The saved profile stays,")
+    print("and will be tried again on the next boot or at the next site.")
+    return None
 
 
 def cmd_ports(args):
@@ -635,13 +793,46 @@ def cmd_setup(args):
     if "IP " in reply:
         ip = reply.split("IP ", 1)[1].split()[0]
         print("\nConnected. Board IP on this network: %s" % ip)
-        print("UDP broadcast will reach it from now on -- no IP needed in the config.")
-        print("(For WSL, which is behind NAT, set \"host\": \"%s\" in %s)"
-              % (ip, CONFIG_PATH))
+        verify_udp(cfg, ip)
+        print("\nNote for WSL, which is behind NAT and cannot broadcast:")
+        print('  set "host": "%s" in %s inside WSL' % (ip, CONFIG_PATH))
     else:
         print("\nSaved, but it did not connect. Check the password and retry.")
+        print("The indicator keeps working over the cable in the meantime.")
         print(reply.strip())
     return 0
+
+
+def cmd_wifi(args):
+    """wifi [test|off|on]"""
+    action = args[0] if args else "test"
+    cfg = load_config()
+
+    if action == "test":
+        reply = talk(cfg, "v1 * status", wait=2.0, until="STATUS")
+        ip = None
+        for token in reply.split():
+            if token.startswith("ip="):
+                ip = token.split("=", 1)[1]
+        if not ip or ip == "-":
+            print("The board is not on Wi-Fi. Run `setup` to add a network.")
+            return 1
+        print("Board IP: %s" % ip)
+        verify_udp(cfg, ip)
+        return 0
+
+    if action == "off":
+        print(talk(cfg, "v1 * wifioff", wait=2.0, until="OK").strip())
+        print("Radio off until the next power cycle; the indicator is on the")
+        print("cable now. To make it permanent, delete the profile: `setup`, d.")
+        return 0
+
+    if action == "on":
+        print(talk(cfg, "v1 * wifi", wait=14.0, until="OK").strip())
+        return 0
+
+    print("usage: claude_rgb.py wifi [test|off|on]")
+    return 2
 
 
 # ------------------------------------------------------------- deployment
@@ -973,6 +1164,7 @@ COMMANDS = {
     "hook": cmd_hook,
     "send": cmd_send,
     "setup": cmd_setup,
+    "wifi": cmd_wifi,
     "deploy": cmd_deploy,
     "status": cmd_status,
     "ports": cmd_ports,

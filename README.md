@@ -365,12 +365,45 @@ python claude_rgb.py send ask       # force a state, to see it
 python claude_rgb.py brightness 25  # 0-255, persisted on the board
 python claude_rgb.py ports          # candidate serial ports
 python claude_rgb.py selftest       # check and fix matrix orientation
+python claude_rgb.py setup          # manage the board's Wi-Fi profiles
+python claude_rgb.py wifi test      # prove datagrams really reach the board
+python claude_rgb.py wifi off       # radio down now, back to the cable
+python claude_rgb.py deploy 01space # push firmware and restart the board
+python claude_rgb.py install        # merge the hooks into settings.json
+python claude_rgb.py uninstall      # remove only our hooks
 ```
+
+Add `--port COM9` (or a device path) to any of them when more than one board
+is plugged in.
+
+### Going back to the cable
+
+Four ways, from lightest to most permanent.
+
+**Nothing at all.** With `transport` on `auto` the cable is always written
+alongside the datagram. Take the board to a site whose network it does not
+know and serial simply carries on.
+
+**Radio off now, without a reboot:**
+
+```bash
+python claude_rgb.py wifi off
+```
+
+The saved profiles are untouched, so the board rejoins on its next power
+cycle. Useful for a quick test or to rule Wi-Fi out of a diagnosis.
+
+**Host-side only**, leaving the board on the network: set
+`"transport": "serial"` in `~/.claude/claude-rgb.json`.
+
+**Permanent**, the board forgets the network: run `setup`, choose `d`, pick
+the entry. It will not rejoin on any boot.
 
 ### Turning it off
 
 - Temporarily: set `"enabled": false` in `~/.claude/claude-rgb.json`. Takes
-  effect on the next event, no restart.
+  effect on the next event, no restart. Manual `send` still works — the flag
+  stops the indicator reacting to your session, not you driving it by hand.
 - Permanently: `python claude_rgb.py uninstall`.
 - Just this board: press and hold **B** to clear all sessions.
 
@@ -465,9 +498,8 @@ python claude_rgb.py setup
    `config.json`. It is never written on the host, never logged, and never
    passes through the shell history.
 
-6. On success it prints the board's IP on that network. Nothing to copy down —
-   the host broadcasts, so it finds the board without an address. The IP is
-   only needed for WSL, which cannot broadcast.
+6. On success it prints the board's IP, then **tests that datagrams actually
+   arrive** and tells you what to do about the result. See below.
 
 Repeat once per site. The board keeps a **list** of profiles and joins
 whichever one is in range at boot, so moving between home, office and
@@ -476,6 +508,33 @@ back to serial silently. `status` reports the current IP, or `-` when offline.
 
 To review or prune the list later, run `setup` again: it shows what is stored
 and offers to delete an entry.
+
+### Why setup tests, and does not just report an IP
+
+An IP address proves almost nothing. The board can hold a perfectly good
+address, answer pings, and still have nothing listening on the port — and
+because UDP is unacknowledged, the sending side cannot tell the difference.
+Any "sent" message from the host is a statement about the host, not about
+delivery.
+
+So the check crosses the two transports: it sends over UDP only, then reads
+the board's own client list back **over the cable**. If the board registered
+the datagram, it arrived. That is the only honest confirmation available, and
+it is exactly the test that caught the bug this feature was born from.
+
+Both paths are checked, and each result means something different:
+
+| Result | What it means | What happens |
+|---|---|---|
+| broadcast reaches the board | Wi-Fi fully working | Nothing to configure. Broadcast needs no address, so moving between sites keeps working by itself |
+| only unicast reaches it | The network isolates its clients — common on guest Wi-Fi and some phone hotspots | Setup offers to write `"host": "<ip>"` into the config. Reserve that address on your router, or DHCP will move it |
+| neither reaches it | Wi-Fi is not usable here | Nothing breaks: `transport` is `auto`, so the cable carries on exactly as before. The profile is kept and retried at the next boot or site |
+
+Run the same check at any time:
+
+```bash
+python claude_rgb.py wifi test
+```
 
 ---
 
@@ -501,6 +560,15 @@ To push some other file, or under another name:
 
 ```bash
 python claude_rgb.py deploy path/to/file.py remote_name.py
+```
+
+**`deploy` does not check syntax.** It copies bytes. A file that does not parse
+will be installed happily, and the board then boots to a bare REPL with the
+LEDs dark. Recovery is just deploying a fixed file — the raw REPL works whether
+or not `main.py` runs — but it is worth gating the push on a compile:
+
+```bash
+python -m py_compile 01space/main.py && python claude_rgb.py deploy 01space
 ```
 
 The knobs worth knowing, in each firmware:
@@ -538,6 +606,9 @@ If an edit ever leaves the board unable to boot, hold **B** while powering up:
 | Panel stuck on one state | A session died mid-flight. Long-press **B**, or wait for the TTL. |
 | Colours right, chase spins the wrong way | Run `selftest` and answer two questions. |
 | Works on Windows, not in WSL | Expected — see the WSL note above. |
+| `status` shows an IP, `send` says sent, board ignores it | Run `wifi test`. If broadcast fails and unicast works, the network isolates clients — set `host`. If both fail, the board holds an address with nothing listening. |
+| Panel dark and unresponsive right after a `deploy` | The file you pushed does not parse. Deploy a fixed one; the raw REPL still works. Compile-check before pushing. |
+| Wi-Fi joined but nothing arrives until a reboot | Fixed. If you are running firmware from before that fix, reboot the board and update it. |
 
 ---
 
@@ -592,9 +663,26 @@ v1 <client_id> <state> [ttl_ms]
 v1 <client_id> gone
 ```
 
-Control messages, serial only, addressed to client `*`: `brightness`,
-`reset`, `status`, `scan`, `netlist`, `netadd`, `netdel`, `wifi`, `layout`,
-`selftest`.
+Control messages, addressed to client `*`. Serial only in practice, since they
+answer on the console:
+
+| Message | Effect |
+|---|---|
+| `brightness <0-255>` | set and persist panel brightness |
+| `reset` | forget every reporting session |
+| `status` | print `ip`, current state, session count, brightness, profile count |
+| `scan` | print networks in range, base64 SSID and dBm |
+| `netlist` | print saved profiles |
+| `netadd <ssid_b64> <pass_b64>` | save a profile and reconnect |
+| `netdel <ssid_b64>` | forget a profile |
+| `wifi` | retry the connection now |
+| `wifioff` | radio down until the next power cycle |
+| `selftest` | light known pixels, to check orientation |
+| `layout <serpentine> <rotate>` | remap the matrix (5×5 only) |
+| `reverse <0\|1>` | flip which end the strip starts from (strip only) |
+
+SSIDs and passwords are base64 so spaces and non-ASCII survive a
+whitespace-delimited protocol.
 
 ---
 

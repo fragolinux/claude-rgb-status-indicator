@@ -401,6 +401,8 @@ def open_udp():
 
 
 def control(parts):
+    global wifi_ip
+
     cmd = parts[2]
     arg = parts[3] if len(parts) > 3 else None
 
@@ -469,6 +471,18 @@ def control(parts):
         wifi_connect(verbose=True)
         print("OK wifi %s" % (wifi_ip or "-"))
 
+    elif cmd == "wifioff":
+        # Radio down now, without a reboot. Saved profiles are left alone, so
+        # this lasts until the next power cycle -- delete the profiles to make
+        # it permanent.
+        try:
+            if wlan is not None:
+                wlan.active(False)
+        except Exception:
+            pass
+        wifi_ip = None
+        print("OK wifioff")
+
     elif cmd == "reverse" and arg is not None:
         cfg["reverse"] = arg in ("1", "true", "True")
         save_config(cfg)
@@ -508,7 +522,7 @@ def handle_line(line):
 
 
 def main():
-    global wifi_next_try
+    global wifi_next_try, wifi_ip
 
     wifi_connect()
     udp = open_udp() if wifi_ip else None
@@ -553,13 +567,24 @@ def main():
                 except Exception:
                     pass
 
-        # Moved location, or the AP came back? Retry quietly in the background.
-        if cfg.get("networks") and time.ticks_diff(time.ticks_ms(), wifi_next_try) >= 0:
-            if wlan is None or not wlan.isconnected():
-                if wifi_connect() and udp is None:
-                    udp = open_udp()
-            else:
-                wifi_next_try = time.ticks_add(time.ticks_ms(), WIFI_RETRY_MS)
+        # Keep the network side live. The connection and the socket are checked
+        # separately, and they have to be: joining a network after boot -- which
+        # is exactly what `netadd` does -- leaves the board connected and
+        # pingable with nothing listening on the port, right up until the next
+        # reboot quietly papers over it.
+        connected = wlan is not None and wlan.isconnected()
+        if not connected and cfg.get("networks"):
+            if time.ticks_diff(time.ticks_ms(), wifi_next_try) >= 0:
+                connected = bool(wifi_connect())
+        if connected and udp is None:
+            udp = open_udp()
+        elif not connected and udp is not None:
+            try:
+                udp.close()
+            except Exception:
+                pass
+            udp = None
+            wifi_ip = None
 
         state = winner()
         if state != current:
