@@ -1,0 +1,23 @@
+# The board's own config, if it is ever pulled off the device.
+# It holds Wi-Fi SSIDs and passwords in plain text -- never commit it.
+config.json
+device/config.json
+
+# Host-side per-machine settings (absolute paths, local IPs).
+claude-rgb.json
+
+# Backups written by `install` and `uninstall`.
+*.bak
+
+# Firmware images, if you keep one next to the source.
+*.bin
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,11 @@
+# Normalise line endings to LF, in the repository and in the working copy on
+# every platform. This repo is cloned across Windows and macOS machines, and
+# its Python files are pushed verbatim onto a MicroPython board -- letting Git
+# rewrite them to CRLF on one platform and back on another produces diffs that
+# are pure noise.
+* text=auto eol=lf
+
+*.bin binary
+*.png binary
+*.jpg binary
+*.pdf binary
