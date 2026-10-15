@@ -294,7 +294,7 @@ does not. Add it in the Dockerfile, or use a base image that includes it.
 | Host | What works |
 |---|---|
 | Linux | Pass the device through: `"runArgs": ["--device=/dev/ttyUSB0"]` in `devcontainer.json`. The cable then behaves normally. |
-| Docker Desktop on Windows or macOS | No USB passthrough exists. Wi-Fi is the practical route. |
+| Docker Desktop on Windows or macOS | No USB passthrough exists. Use the host relay (below), or Wi-Fi. |
 | GitHub Codespaces | Remote machine, no LAN access to your desk at all. The indicator cannot be reached; leave it uninstalled there. |
 
 For the Wi-Fi route, the container reaches the LAN through Docker's NAT, so
@@ -306,6 +306,41 @@ bridge. Set the address explicitly, in the config *inside* the container:
 ```
 
 Reserve that address for the board on your router, or DHCP will move it.
+
+#### Host relay: the cable, from inside a container
+
+With the board on the host's cable, the host can forward for the container.
+Docker Desktop delivers UDP sent to `host.docker.internal` on the host's
+**loopback** (measured on macOS: source `127.0.0.1`), so `relay` listens on
+`127.0.0.1:47281` and writes every `v1 …` line to the serial port. Loopback
+also keeps it deaf to the host's own broadcasts, which already go down the
+cable. No Wi-Fi, no board IP, and it keeps working on a VPN.
+
+```bash
+python3 claude_rgb.py relay install        # macOS: a launchd agent, starts at login
+python3 claude_rgb.py relay uninstall
+python3 claude_rgb.py relay                # foreground, any OS, for testing
+```
+
+Log: `~/Library/Logs/claude-rgb-relay.log`.
+
+If every container mounts a host directory as its `~/.claude` (rather than
+discarding it on rebuild), install the hooks there, from the host — nothing
+lands in any repository:
+
+```bash
+# <dir>: the host-side directory the containers mount as ~/.claude
+python3 claude_rgb.py install --container <dir>
+```
+
+That copies `claude_rgb.py` into the directory, merges hooks running
+`python3 "$HOME/.claude/claude_rgb.py" hook`, and writes the container config
+`{"host": "host.docker.internal", "transport": "udp"}` if none exists.
+
+**The copy does not follow the checkout: re-run the same command after every
+change to `claude_rgb.py`**, then restart Claude Code in the container.
+Sessions from host and containers are distinct clients
+(`<hostname>:<session>`), so the board arbitrates between them as usual.
 
 ### WSL
 
