@@ -22,6 +22,11 @@ Usage:
     claude_rgb.py install          merge the hooks into ~/.claude/settings.json
     claude_rgb.py install --project  ... into the repo's .claude/settings.json,
                                    portable: for dev containers and Codespaces
+    claude_rgb.py install --container <dir>
+                                   ... into a container's ~/.claude, given as
+                                   its host-side directory; sends via the relay
+    claude_rgb.py relay            forward UDP from loopback to the cable
+    claude_rgb.py relay install    ... as a launchd agent (macOS); `uninstall`
     claude_rgb.py uninstall        remove only our hooks, leave the rest
 
 Per-machine settings live in ~/.claude/claude-rgb.json:
@@ -1014,7 +1019,33 @@ def cmd_install(args):
     project = "--project" in args
     args = [a for a in args if a != "--project"]
 
-    if project:
+    # --container <dir>: <dir> is, seen from the host, a directory that a
+    # container mounts as its ~/.claude (e.g. ~/.devcontainer-shared/.claude).
+    # The script is copied there, so the hook only needs python3 and $HOME
+    # inside the container, and nothing lands in any repository.
+    container_dir = None
+    if "--container" in args:
+        i = args.index("--container")
+        if i + 1 >= len(args):
+            print("usage: claude_rgb.py install --container <container ~/.claude seen from the host>")
+            return 2
+        container_dir = os.path.abspath(os.path.expanduser(args[i + 1]))
+        del args[i:i + 2]
+
+    if container_dir:
+        import shutil
+        os.makedirs(container_dir, exist_ok=True)
+        shutil.copyfile(os.path.abspath(__file__),
+                        os.path.join(container_dir, "claude_rgb.py"))
+        settings_path = os.path.join(container_dir, "settings.json")
+        command = 'python3 "$HOME/.claude/claude_rgb.py" hook'
+        container_cfg = os.path.join(container_dir, "claude-rgb.json")
+        if not os.path.exists(container_cfg):
+            cfg = dict(DEFAULT_CONFIG)
+            cfg.update({"host": "host.docker.internal", "transport": "udp"})
+            with open(container_cfg, "w") as f:
+                json.dump(cfg, f, indent=2)
+    elif project:
         settings_path = os.path.join(os.getcwd(), ".claude", "settings.json")
         script = os.path.abspath(__file__)
         root = os.getcwd()
@@ -1077,10 +1108,14 @@ def cmd_install(args):
     with open(settings_path, "w") as f:
         json.dump(settings, f, indent=2)
 
-    if not os.path.exists(CONFIG_PATH):
+    if not container_dir and not os.path.exists(CONFIG_PATH):
         save_config(dict(DEFAULT_CONFIG))
 
     print("Installed %d hooks into %s" % (len(HOOK_EVENTS), settings_path))
+    if container_dir:
+        print("  script copied there; re-run this after updating claude_rgb.py")
+        print("  container config: %s" % os.path.join(container_dir, "claude-rgb.json"))
+        print("  the host needs the relay: claude_rgb.py relay install")
     if project:
         print("  portable form: python3 + ${CLAUDE_PROJECT_DIR}, no absolute paths")
         print("  commit this file so it survives a container rebuild")
@@ -1130,6 +1165,99 @@ def cmd_uninstall(args):
         json.dump(settings, f, indent=2)
     print("Removed %d claude-rgb entries from %s" % (removed, settings_path))
     print("Backup at %s" % backup)
+    return 0
+
+
+# ------------------------------------------------------------------ relay
+#
+# Docker Desktop on macOS/Windows has no USB passthrough, and a container's
+# broadcast never leaves Docker's bridge. A container can, however, reach the
+# host at host.docker.internal: Docker Desktop delivers that UDP on the host's
+# loopback (measured: source 127.0.0.1). So the host listens on loopback and
+# copies each line onto the cable. Binding loopback, not 0.0.0.0, also keeps
+# the relay deaf to the host's own hook broadcasts, which already go down the
+# cable directly and would otherwise be written twice.
+
+RELAY_LABEL = "com.claude-rgb.relay"
+RELAY_PLIST = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents",
+                           RELAY_LABEL + ".plist")
+RELAY_LOG = os.path.join(os.path.expanduser("~"), "Library", "Logs",
+                         "claude-rgb-relay.log")
+
+
+def _relay_serve(bind):
+    cfg = load_config()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((bind, UDP_PORT))
+    print("relay: %s:%d -> serial" % (bind, UDP_PORT), flush=True)
+    while True:
+        data, source = sock.recvfrom(1024)
+        # One datagram may carry several lines; anything not speaking the
+        # protocol is dropped rather than written to the board.
+        for line in data.decode(errors="replace").splitlines():
+            line = line.strip()
+            if not line.startswith("v1 "):
+                continue
+            if not send_serial(cfg, line):
+                print("relay: serial write failed for %r from %s"
+                      % (line, source[0]), flush=True)
+
+
+def _relay_install():
+    if sys.platform != "darwin":
+        print("relay install manages a launchd agent, macOS only.")
+        print("Elsewhere, run `claude_rgb.py relay` from your own service manager.")
+        return 1
+    import plistlib
+    import subprocess
+    plist = {
+        "Label": RELAY_LABEL,
+        "ProgramArguments": [sys.executable or "python3",
+                             os.path.abspath(__file__), "relay"],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": RELAY_LOG,
+        "StandardErrorPath": RELAY_LOG,
+    }
+    os.makedirs(os.path.dirname(RELAY_PLIST), exist_ok=True)
+    os.makedirs(os.path.dirname(RELAY_LOG), exist_ok=True)
+    domain = "gui/%d" % os.getuid()
+    # bootout first so a re-install picks up a moved script or interpreter.
+    subprocess.run(["launchctl", "bootout", "%s/%s" % (domain, RELAY_LABEL)],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with open(RELAY_PLIST, "wb") as f:
+        plistlib.dump(plist, f)
+    result = subprocess.run(["launchctl", "bootstrap", domain, RELAY_PLIST])
+    if result.returncode != 0:
+        print("launchctl bootstrap failed (%d)" % result.returncode)
+        return 1
+    print("relay agent loaded: %s" % RELAY_PLIST)
+    print("  log: %s" % RELAY_LOG)
+    return 0
+
+
+def _relay_uninstall():
+    import subprocess
+    subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), RELAY_LABEL)],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if os.path.exists(RELAY_PLIST):
+        os.remove(RELAY_PLIST)
+    print("relay agent removed")
+    return 0
+
+
+def cmd_relay(args):
+    """Forward UDP lines arriving on loopback to the board over the cable."""
+    if args and args[0] == "install":
+        return _relay_install()
+    if args and args[0] == "uninstall":
+        return _relay_uninstall()
+    bind = "127.0.0.1"
+    if "--bind" in args:
+        i = args.index("--bind")
+        if i + 1 < len(args):
+            bind = args[i + 1]
+    _relay_serve(bind)
     return 0
 
 
@@ -1227,6 +1355,7 @@ COMMANDS = {
     "selftest": cmd_selftest,
     "install": cmd_install,
     "uninstall": cmd_uninstall,
+    "relay": cmd_relay,
 }
 
 
